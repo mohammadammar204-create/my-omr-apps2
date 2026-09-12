@@ -153,7 +153,7 @@ def process_omr_with_ai(img_bytes, total_q, key_dict, key):
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
     clean_key = str(key).strip()
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={clean_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={clean_key}"
     headers = {"Content-Type": "application/json"}
     
     prompt = f"""
