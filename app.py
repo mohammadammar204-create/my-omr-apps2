@@ -1,8 +1,18 @@
 import arabic_reshaper
 from bidi.algorithm import get_display
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# Register Arabic Font (Make sure Arial.ttf is in your GitHub repo)
+try:
+    pdfmetrics.registerFont(TTFont('ArabicFont', 'Arial.ttf'))
+    ARABIC_FONT = 'ArabicFont'
+except Exception as e:
+    # Fallback if font file is missing
+    ARABIC_FONT = 'Helvetica'
 
 def reshape_arabic_text(text):
-    """Reshapes and reverses Arabic text for proper PDF rendering."""
+    """Reshapes and reverses Arabic text for correct PDF rendering."""
     if not text or str(text).lower() == 'nan':
         return ""
     reshaped_text = arabic_reshaper.reshape(str(text))
@@ -19,24 +29,25 @@ def create_pdf_bytes(student_name, student_id, exam_title, total_q):
     c.rect(30, 30, 20, 20, fill=1)
     c.rect(562, 30, 20, 20, fill=1)
     
-    # 2. Generate QR Code containing Student Data
+    # 2. Generate QR Code
     qr = qrcode.make(f"{student_id}:{student_name}")
     qr_pil = qr.get_image()
     qr_reader = ImageReader(qr_pil)
     c.drawImage(qr_reader, 470, 665, width=75, height=75)
     
-    # 3. Exam Title & Clean Arabic Student Name (ID Removed)
+    # 3. Header Information
     c.setFont("Helvetica-Bold", 16)
     c.drawString(60, 740, str(exam_title))
     
+    # Render Arabic Student Name using the registered Arabic Font
     formatted_name = reshape_arabic_text(student_name)
-    c.setFont("Helvetica", 12)
+    c.setFont(ARABIC_FONT, 12)
     c.drawString(60, 705, f"Student Name: {formatted_name}")
     
     c.setLineWidth(1)
     c.line(60, 680, 542, 680)
     
-    # 4. Bubble Grid Questions
+    # 4. Questions Grid
     start_y = 650
     for q in range(1, total_q + 1):
         col_offset = ((q - 1) // 25) * 130
