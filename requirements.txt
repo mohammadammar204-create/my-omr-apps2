@@ -1,10 +1,10 @@
 streamlit
 pandas
-openpyxl
-reportlab
+requests
+beautifulsoup4
 qrcode
-opencv-python-headless
-pillow
-arabic_reshaper
 python-bidi
-google-genai
+arabic-reshaper
+reportlab
+Pillow
+openpyxl
