@@ -175,7 +175,7 @@ def process_omr_with_ai(img_bytes, total_q, key_dict, key):
     """
     
     payload = {
-        "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "model": "google/gemini-2.0-flash-lite-001:free",
         "messages": [
             {
                 "role": "user",
