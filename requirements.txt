@@ -6,3 +6,5 @@ openpyxl
 reportlab
 qrcode
 Pillow
+arabic-reshaper
+python-bidi
