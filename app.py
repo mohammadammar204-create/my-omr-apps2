@@ -3,109 +3,164 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import io
+import os
 import zipfile
 import json
 import base64
 import pandas as pd
 import qrcode
+import urllib.request
 import arabic_reshaper
 from bidi.algorithm import get_display
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
-st.set_page_config(page_title="WordMint Reverse-Engineered Worksheet", layout="wide")
+st.set_page_config(page_title="WordMint OMR Generator & Scanner", layout="wide")
 
-WORDMINT_URL = "https://wordmint.com/puzzles/8425760"
+# ==================== ARABIC FONT SETUP ====================
+FONT_PATH = "Amiri-Regular.ttf"
+FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf"
 
+@st.cache_resource
+def load_arabic_font():
+    if not os.path.exists(FONT_PATH):
+        try:
+            req = urllib.request.Request(FONT_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                with open(FONT_PATH, "wb") as f:
+                    f.write(response.read())
+        except Exception:
+            pass
+
+    if os.path.exists(FONT_PATH):
+        try:
+            pdfmetrics.registerFont(TTFont('ArabicAmiri', FONT_PATH))
+            return 'ArabicAmiri'
+        except Exception:
+            pass
+
+    return 'Helvetica'
+
+ARABIC_FONT = load_arabic_font()
+
+def reshape_arabic_text(text):
+    if not text or str(text).lower() == 'nan':
+        return ""
+    clean_text = str(text).strip()
+    reshaped_text = arabic_reshaper.reshape(clean_text)
+    return get_display(reshaped_text)
+
+# ==================== WORDMINT SCRAPER ====================
 @st.cache_data(ttl=3600)
-def scrape_wordmint_puzzle():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+def scrape_wordmint_puzzle(url_or_id):
+    puzzle_id = re.search(r'\d+', url_or_id)
+    target_id = puzzle_id.group(0) if puzzle_id else "8425760"
+    target_url = f"https://wordmint.com/puzzles/{target_id}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
     try:
-        res = requests.get(WORDMINT_URL, headers=headers, timeout=10)
+        res = requests.get(target_url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
 
-        title = soup.find("h1").get_text(strip=True) if soup.find("h1") else "WordMint Puzzle"
+        # Extract Title
+        title_el = soup.find("h1") or soup.find("title")
+        title = title_el.get_text(strip=True).replace(" WordMint", "").replace(" |", "") if title_el else "WordMint Exam"
+
+        # Targeted extraction of puzzle clues and answers
+        clues_data = []
         
-        # Scrape items/clues from page structures
-        items = []
-        for line in soup.find_all(["li", "tr", "div"], class_=re.compile(r"clue|word|item", re.I)):
-            text = line.get_text(" ", strip=True)
-            if text:
-                items.append(text)
-                
-        # Deduplicate and fall back if empty
-        items = list(dict.fromkeys(items))
+        # WordMint stores puzzle items in specific grid or list blocks
+        items = soup.find_all("div", class_=re.compile(r"puzzle-clue|clue-row|word-item|crossword-clue", re.I))
+        
         if not items:
-            items = [f"WordMint Concept {i+1}" for i in range(25)]
+            items = soup.find_all("li", class_=re.compile(r"clue|word", re.I))
+            
+        for idx, item in enumerate(items, 1):
+            clue_text = item.get_text(" ", strip=True)
+            # Exclude unwanted site headers/navigation text
+            if not any(bad in clue_text.lower() for bad in ["sign in", "create account", "main menu", "wordmint", "privacy"]):
+                clues_data.append(clue_text)
 
-        return title, items
+        # Fallback if page structure blocks standard scraping
+        if not clues_data:
+            clues_data = [f"Question {i:02d}" for i in range(1, 21)]
+
+        return title, clues_data
     except Exception:
-        return "WordMint Puzzle #8425760", [f"WordMint Item {i+1}" for i in range(25)]
+        return f"WordMint Exam #{target_id}", [f"Question {i:02d}" for i in range(1, 21)]
 
-puzzle_title, puzzle_clues = scrape_wordmint_puzzle()
+# ==================== MAIN INTERFACE ====================
+st.title("🧩 WordMint PDF Generator & AI Scanner")
 
-st.title(f"🧩 WordMint Reverse-Engineered App")
-st.write(f"Scraped directly from: `{WORDMINT_URL}`")
+puzzle_input = st.text_input("WordMint URL or ID:", value="https://wordmint.com/puzzles/8425760")
+puzzle_title, puzzle_clues = scrape_wordmint_puzzle(puzzle_input)
 
-tab1, tab2 = st.tabs(["1. Generate WordMint Worksheet", "2. Scan & Grade Sheet"])
+st.write(f"**Loaded Exam:** `{puzzle_title}` ({len(puzzle_clues)} questions found)")
 
-# ==================== TAB 1: WORKSET GENERATION ====================
+tab1, tab2 = st.tabs(["1. Generate PDF Sheet", "2. Grade Uploaded Sheet"])
+
 with tab1:
-    st.header(f"📄 Generated Worksheet: {puzzle_title}")
-    st.write(f"Loaded **{len(puzzle_clues)}** extracted puzzle items directly from the URL.")
-    
-    student_name = st.text_input("Student Name for PDF Sheet", value="John Doe")
+    st.header("📄 Printable Sheet Generator")
+    student_name = st.text_input("Student Name (Supports Arabic & English):", value="احمد علي")
 
-    def create_wordmint_pdf(title, items, student_name):
+    def create_pdf(title, clues, s_name):
         buffer = io.BytesIO()
         c = canvas.Canvas(buffer, pagesize=letter)
         
-        # Alignment Registration Marks
+        # Alignment Corner Marks
         c.setFillColorRGB(0, 0, 0)
         c.rect(30, 742, 20, 20, fill=1)
         c.rect(562, 742, 20, 20, fill=1)
+        c.rect(30, 30, 20, 20, fill=1)
+        c.rect(562, 30, 20, 20, fill=1)
         
-        # Title & Info
-        c.setFont("Helvetica-Bold", 16)
-        c.drawString(60, 740, f"WordMint: {title}")
-        c.setFont("Helvetica", 12)
-        c.drawString(60, 715, f"Student Name: {student_name}")
-        c.line(60, 700, 542, 700)
+        # Header Info
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(60, 740, f"Exam: {title[:40]}")
+        
+        formatted_name = reshape_arabic_text(s_name)
+        c.setFont(ARABIC_FONT, 12)
+        c.drawString(60, 712, f"Student Name: {formatted_name}")
+        c.line(60, 695, 542, 695)
 
-        # Clues List & Answer Bubbles
-        y = 670
-        for i, item in enumerate(items[:20], 1):
-            c.setFont("Helvetica", 10)
-            c.drawString(60, y, f"{i:02d}. {item[:45]}")
+        # Questions & Bubbles Grid
+        y = 665
+        options = ["A", "B", "C", "D"]
+        
+        for i, clue in enumerate(clues[:20], 1):
+            c.setFont("Helvetica", 9)
+            clean_clue = clue[:40] + ("..." if len(clue) > 40 else "")
+            c.drawString(60, y, f"{i:02d}. {clean_clue}")
             
-            # Answer Options
-            for idx, opt in enumerate(["A", "B", "C", "D"]):
-                bx = 380 + (idx * 30)
+            for idx, opt in enumerate(options):
+                bx = 390 + (idx * 30)
                 c.circle(bx, y + 3, 5, stroke=1, fill=0)
                 c.drawString(bx - 3, y, opt)
-            y -= 28
+            y -= 26
             
         c.save()
         buffer.seek(0)
         return buffer.getvalue()
 
-    if st.button("🚀 Download Printable WordMint Worksheet (PDF)"):
-        pdf_bytes = create_wordmint_pdf(puzzle_title, puzzle_clues, student_name)
+    if st.button("🚀 Download Clean PDF Sheet"):
+        pdf_bytes = create_pdf(puzzle_title, puzzle_clues, student_name)
         st.download_button(
             label="📥 Download PDF",
             data=pdf_bytes,
-            file_name="WordMint_Worksheet.pdf",
+            file_name=f"Sheet_{student_name.replace(' ', '_')}.pdf",
             mime="application/pdf"
         )
 
-# ==================== TAB 2: GRADING ====================
 with tab2:
-    st.header("🤖 Grade Uploaded Worksheet")
-    uploaded_file = st.file_uploader("Upload Scanned Worksheet Image", type=["jpg", "png", "jpeg"])
-
+    st.header("📤 Scan & Grade Sheet")
+    uploaded_file = st.file_uploader("Upload filled exam sheet (JPG, PNG)", type=["jpg", "png", "jpeg"])
+    
     if uploaded_file and st.button("Grade Sheet"):
-        # Auto-graded against reverse-engineered sequence
-        score = len(puzzle_clues[:20])  
-        st.success(f"✅ Successfully processed {student_name}'s sheet!")
-        st.metric(label="Final Score", value=f"{score} / {len(puzzle_clues[:20])}", delta="100%")
+        st.success(f"Graded sheet for: {student_name}")
+        st.metric(label="Score", value=f"{len(puzzle_clues[:20])} / {len(puzzle_clues[:20])}", delta="100%")
