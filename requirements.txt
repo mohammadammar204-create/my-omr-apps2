@@ -8,3 +8,4 @@ qrcode
 Pillow
 arabic-reshaper
 python-bidi
+requests
