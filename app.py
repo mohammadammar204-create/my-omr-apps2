@@ -174,54 +174,61 @@ def process_omr_with_ai(img_bytes, total_q, key_dict, key):
     }}
     """
     
-    payload = {
-        "model": "google/gemini-2.0-flash-lite-001:free",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
+    models_to_try = [
+        "google/gemini-flash-1.5-8b",
+        "google/gemini-2.0-flash-001",
+        "meta-llama/llama-3.2-11b-vision-instruct"
+    ]
+
+    for model_name in models_to_try:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
                         }
-                    }
-                ]
-            }
-        ],
-        "response_format": {"type": "json_object"}
-    }
+                    ]
+                }
+            ],
+            "response_format": {"type": "json_object"}
+        }
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        res_json = response.json()
-        
-        if response.status_code != 200:
-            st.error(f"API Error ({response.status_code}): {res_json.get('error', {}).get('message', 'Unknown Error')}")
-            return "Auth Error", 0
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            res_json = response.json()
             
-        raw_text = res_json["choices"][0]["message"]["content"]
-        data = json.loads(raw_text)
-        
-        extracted_name = data.get("student_name", "Unknown Student")
-        detected_answers = data.get("answers", {})
+            if response.status_code == 200:
+                raw_text = res_json["choices"][0]["message"]["content"]
+                data = json.loads(raw_text)
+                
+                extracted_name = data.get("student_name", "Unknown Student")
+                detected_answers = data.get("answers", {})
 
-        score = 0
-        for q in range(1, total_q + 1):
-            student_ans = detected_answers.get(str(q))
-            correct_ans = key_dict.get(q)
-            if student_ans and str(student_ans).upper() == str(correct_ans).upper():
-                score += 1
+                score = 0
+                for q in range(1, total_q + 1):
+                    student_ans = detected_answers.get(str(q))
+                    correct_ans = key_dict.get(q)
+                    if student_ans and str(student_ans).upper() == str(correct_ans).upper():
+                        score += 1
 
-        return extracted_name, score
+                return extracted_name, score
+            elif response.status_code == 404:
+                continue
+            else:
+                st.error(f"API Error ({response.status_code}): {res_json.get('error', {}).get('message', 'Unknown Error')}")
+                return "Auth Error", 0
+        except Exception:
+            continue
 
-    except Exception as e:
-        st.error(f"AI Vision Processing Error: {e}")
-        return "Processing Error", 0
+    st.error("No active vision model endpoints responded. Check your OpenRouter account balance or API key.")
+    return "Processing Error", 0
 
 # ==================== TAB 1 ====================
 with tab1:
