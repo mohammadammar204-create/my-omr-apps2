@@ -1,11 +1,10 @@
 streamlit
-opencv-python-headless
-numpy
 pandas
 openpyxl
 reportlab
 qrcode
-Pillow
-arabic-reshaper
+opencv-python-headless
+pillow
+arabic_reshaper
 python-bidi
-requests
+google-genai
