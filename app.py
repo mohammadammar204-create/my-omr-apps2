@@ -21,7 +21,7 @@ st.set_page_config(page_title="Online OMR Scanner & Pre-printed Generator", layo
 st.title("📄 Pre-printed OMR Sheet Generator & Scanner")
 st.write("Generate personalized bubble sheets with embedded QR codes and manage exam grading seamlessly.")
 
-# ==================== CRASH-PROOF ARABIC FONT INITIALIZATION ====================
+# ==================== ARABIC FONT INITIALIZATION ====================
 FONT_PATH = "Amiri-Regular.ttf"
 FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf"
 
@@ -47,11 +47,10 @@ def load_arabic_font():
 
 ARABIC_FONT = load_arabic_font()
 
-# Global state management
 if 'students_df' not in st.session_state:
     st.session_state.students_df = None
 
-# ==================== SIDEBAR: ANSWER KEY SELECTOR ====================
+# ==================== SIDEBAR: ANSWER KEY ====================
 st.sidebar.header("🔑 Set Correct Answer Key")
 num_questions = st.sidebar.number_input("Number of Questions", min_value=5, max_value=100, value=25, step=5)
 
@@ -100,20 +99,20 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     
-    # 1. Corner Calibration Anchors
+    # Corner Registration Marks
     c.setFillColorRGB(0, 0, 0)
     c.rect(30, 742, 20, 20, fill=1)
     c.rect(562, 742, 20, 20, fill=1)
     c.rect(30, 30, 20, 20, fill=1)
     c.rect(562, 30, 20, 20, fill=1)
     
-    # 2. QR Code (Encodes student name directly)
+    # QR Code
     qr = qrcode.make(f"{student_name}")
     qr_pil = qr.get_image()
     qr_reader = ImageReader(qr_pil)
     c.drawImage(qr_reader, 470, 665, width=75, height=75)
     
-    # 3. Header Setup
+    # Title & Name
     c.setFont("Helvetica-Bold", 16)
     c.drawString(60, 740, str(exam_title))
     
@@ -124,7 +123,7 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     c.setLineWidth(1)
     c.line(60, 680, 542, 680)
     
-    # 4. Bubble Grid Generator
+    # Questions
     start_y = 650
     for q in range(1, total_q + 1):
         col_offset = ((q - 1) // 25) * 130
@@ -143,7 +142,86 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     buffer.seek(0)
     return buffer.getvalue()
 
-# ==================== TAB 1: UPLOAD ====================
+def process_omr_image(img_bytes, total_q, key_dict):
+    """Aligns sheet and processes filled bubble circles."""
+    np_arr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return "Unknown Student", 0
+
+    # 1. Decode QR Code for Student Name
+    qr_detector = cv2.QRCodeDetector()
+    student_name, _, _ = qr_detector.detectAndDecode(img)
+    if not student_name:
+        student_name = "Unknown Student"
+
+    # 2. Image Preprocessing (Grayscale + Thresholding)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    # 3. Find Page Perspective Transformation Corners
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rects = []
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+        if len(approx) == 4 and cv2.contourArea(cnt) > 200:
+            rects.append(approx)
+
+    # Warp image to a standardized 612x792 resolution (Letter size scale)
+    h, w = thresh.shape[:2]
+    warped = thresh
+
+    if len(rects) >= 4:
+        # Sort corners: Top-Left, Top-Right, Bottom-Right, Bottom-Left
+        pts = np.array([r.reshape(4, 2) for r in rects[:4]]).reshape(-1, 2)
+        s = pts.sum(axis=1)
+        diff = np.diff(pts, axis=1)
+
+        tl = pts[np.argmin(s)]
+        br = pts[np.argmax(s)]
+        tr = pts[np.argmin(diff)]
+        bl = pts[np.argmax(diff)]
+
+        src_pts = np.float32([tl, tr, br, bl])
+        dst_pts = np.float32([[0, 0], [612, 0], [612, 792], [0, 792]])
+        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(thresh, matrix, (612, 792))
+
+    # 4. Measure Bubble Pixel Densities
+    score = 0
+    start_y = 142  # Scaled coordinate offset corresponding to ReportLab PDF layout
+    
+    for q in range(1, total_q + 1):
+        col_offset = ((q - 1) // 25) * 130
+        row = (q - 1) % 25
+        y_center = int(start_y + (row * 22))
+        x_start = int(60 + col_offset)
+
+        bubble_counts = []
+        for idx, opt in enumerate(options):
+            bx = int(x_start + 25 + (idx * 20))
+            # Define ROI bounding circle area
+            roi = warped[y_center - 5 : y_center + 5, bx - 5 : bx + 5]
+            non_zero = cv2.countNonZero(roi) if roi.size > 0 else 0
+            bubble_counts.append((non_zero, opt))
+
+        # Sort options by pixel density
+        bubble_counts.sort(key=lambda item: item[0], reverse=True)
+        detected_choice = bubble_counts[0][1]
+        max_filled = bubble_counts[0][0]
+
+        # Ensure bubble was distinctly shaded (minimum fill threshold)
+        if max_filled > 25 and detected_choice == key_dict.get(q):
+            score += 1
+
+    return student_name, score
+
+# ==================== TAB 1 ====================
 with tab1:
     st.header("📋 Step 1: Upload Class Roster")
     student_file = st.file_uploader("Upload class list (XLSX, CSV, TXT)", type=["xlsx", "xls", "csv", "txt"], key="tab1_student_file")
@@ -155,7 +233,7 @@ with tab1:
         except Exception as e:
             st.error(f"Error reading file: {e}")
 
-# ==================== TAB 2: GENERATE ====================
+# ==================== TAB 2 ====================
 with tab2:
     st.header("🖨️ Step 2: Generate Pre-printed PDFs")
     col1, col2 = st.columns(2)
@@ -193,35 +271,19 @@ with tab2:
                 mime="application/zip"
             )
 
-# ==================== TAB 3: SCAN & GRADE ====================
+# ==================== TAB 3 ====================
 with tab3:
     st.header("📤 Step 3: Scan & Grade Answers")
     uploaded_files = st.file_uploader("Upload filled student sheets (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
     if uploaded_files:
         results = []
-        qr_detector = cv2.QRCodeDetector()
-        
         for file in uploaded_files:
-            file_bytes = np.frombuffer(file.read(), np.uint8)
-            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            file_bytes = file.read()
+            student_name, score = process_omr_image(file_bytes, int(num_questions), answer_key)
             
-            if img is None:
-                continue
-                
-            # Extract Student Name via QR reader
-            student_name = ""
-            qr_data, _, _ = qr_detector.detectAndDecode(img)
-            if qr_data:
-                student_name = qr_data.strip()
-            else:
+            if student_name == "Unknown Student":
                 student_name = os.path.splitext(file.name)[0]
-            
-            # Deterministic answer scoring algorithm
-            score = 0
-            for q in range(1, int(num_questions) + 1):
-                correct_opt = answer_key.get(q, "A")
-                score += 1 if correct_opt == "A" else 0
-
+                
             pct = (score / num_questions) * 100
             
             results.append({
