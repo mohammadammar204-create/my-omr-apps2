@@ -5,6 +5,8 @@ import io
 import os
 import zipfile
 import json
+import base64
+import requests
 import qrcode
 import urllib.request
 from PIL import Image
@@ -15,24 +17,14 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from google import genai
-from google.genai import types
 
 st.set_page_config(page_title="AI OMR Scanner & Generator", layout="wide")
 
 st.title("📄 AI-Powered OMR Sheet Generator & Scanner")
 st.write("Generate personalized bubble sheets and grade them using Gemini AI Vision.")
 
-# ==================== GEMINI AI CLIENT SETUP ====================
+# ==================== API KEY RETRIEVAL ====================
 api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
-
-@st.cache_resource
-def get_ai_client(key):
-    if key:
-        return genai.Client(api_key=key)
-    return None
-
-client = get_ai_client(api_key)
 
 # ==================== ARABIC FONT SETUP ====================
 FONT_PATH = "Amiri-Regular.ttf"
@@ -112,7 +104,7 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     
-    # Calibration Anchors
+    # Registration Marks
     c.setFillColorRGB(0, 0, 0)
     c.rect(30, 742, 20, 20, fill=1)
     c.rect(562, 742, 20, 20, fill=1)
@@ -125,7 +117,7 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     qr_reader = ImageReader(qr_pil)
     c.drawImage(qr_reader, 470, 665, width=75, height=75)
     
-    # Header
+    # Header Information
     c.setFont("Helvetica-Bold", 16)
     c.drawString(60, 740, str(exam_title))
     
@@ -136,7 +128,7 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     c.setLineWidth(1)
     c.line(60, 680, 542, 680)
     
-    # Questions
+    # Question Grid
     start_y = 650
     for q in range(1, total_q + 1):
         col_offset = ((q - 1) // 25) * 130
@@ -155,39 +147,58 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     buffer.seek(0)
     return buffer.getvalue()
 
-def process_omr_with_ai(img_bytes, total_q, key_dict):
-    if not client:
+def process_omr_with_ai(img_bytes, total_q, key_dict, key):
+    if not key:
         return "API Key Missing", 0
 
-    image = Image.open(io.BytesIO(img_bytes))
-
+    base64_image = base64.b64encode(img_bytes).decode("utf-8")
+    
+    # REST Endpoint using direct header auth
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": key.strip()
+    }
+    
     prompt = f"""
     Analyze this exam sheet image carefully.
-    1. Extract the student name written at the top next to "Student Name:" or decoded from the QR code.
+    1. Extract the student name written next to "Student Name:" or decoded from the top QR code.
     2. Examine questions Q01 through Q{total_q:02d}.
-    3. For each question, determine which bubble option (A, B, C, or D) is filled/shaded in with pencil or pen. If a question is left completely blank or has multiple bubbles filled, mark it as null.
+    3. Determine which option (A, B, C, or D) is filled/shaded in pencil or pen. If unshaded, mark as null.
     
-    Return ONLY a raw JSON object with this exact structure:
+    Return ONLY a raw JSON object formatted like this:
     {{
       "student_name": "Extracted Student Name",
       "answers": {{
         "1": "A",
-        "2": "B",
-        "3": null
+        "2": "B"
       }}
     }}
     """
+    
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}},
+                {"text": prompt}
+            ]
+        }],
+        "generationConfig": {
+            "response_mime_type": "application/json"
+        }
+    }
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[image, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
-        )
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        res_json = response.json()
         
-        data = json.loads(response.text)
+        if response.status_code != 200:
+            st.error(f"API Error ({response.status_code}): {res_json.get('error', {}).get('message', 'Unknown Error')}")
+            return "Auth Error", 0
+            
+        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+        data = json.loads(raw_text)
+        
         extracted_name = data.get("student_name", "Unknown Student")
         detected_answers = data.get("answers", {})
 
@@ -270,9 +281,9 @@ with tab3:
             
             for idx, file in enumerate(uploaded_files):
                 file_bytes = file.read()
-                student_name, score = process_omr_with_ai(file_bytes, int(num_questions), answer_key)
+                student_name, score = process_omr_with_ai(file_bytes, int(num_questions), answer_key, api_key)
                 
-                if student_name in ["Unknown Student", "Processing Error"]:
+                if student_name in ["Unknown Student", "Processing Error", "Auth Error"]:
                     student_name = os.path.splitext(file.name)[0]
                     
                 pct = (score / num_questions) * 100
