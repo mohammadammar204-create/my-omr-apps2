@@ -20,10 +20,10 @@ from reportlab.pdfbase.ttfonts import TTFont
 st.set_page_config(page_title="AI OMR Scanner & Generator", layout="wide")
 
 st.title("📄 AI-Powered OMR Sheet Generator & Scanner")
-st.write("Generate personalized bubble sheets and grade them using OpenRouter AI Vision.")
+st.write("Generate personalized bubble sheets and grade them using 100% free Hugging Face Vision AI.")
 
 # ==================== API KEY RETRIEVAL ====================
-api_key = st.secrets.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY"))
+hf_token = st.secrets.get("HF_TOKEN", os.getenv("HF_TOKEN"))
 
 # ==================== ARABIC FONT SETUP ====================
 FONT_PATH = "Amiri-Regular.ttf"
@@ -146,88 +146,83 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     buffer.seek(0)
     return buffer.getvalue()
 
-def process_omr_with_ai(img_bytes, total_q, key_dict, key):
-    if not key:
-        return "API Key Missing", 0
+def process_omr_with_ai(img_bytes, total_q, key_dict, token):
+    if not token:
+        return "API Token Missing", 0
 
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
     
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {key.strip()}",
-        "Content-Type": "application/json"
-    }
-    
     prompt = f"""
-    Analyze this exam sheet image carefully.
-    1. Extract the student name written next to "Student Name:" or decoded from the top QR code.
-    2. Examine questions Q01 through Q{total_q:02d}.
-    3. Determine which option (A, B, C, or D) is filled/shaded in pencil or pen. If unshaded, mark as null.
-    
-    Return ONLY a raw JSON object formatted like this:
+    Analyze this OMR exam sheet image.
+    Extract the student name and filled choices for questions 1 to {total_q}.
+    Return strictly JSON:
     {{
-      "student_name": "Extracted Student Name",
+      "student_name": "Extracted Name",
       "answers": {{
         "1": "A",
         "2": "B"
       }}
     }}
     """
-    
-    models_to_try = [
-        "google/gemini-flash-1.5-8b",
-        "google/gemini-2.0-flash-001",
-        "meta-llama/llama-3.2-11b-vision-instruct"
+
+    headers = {
+        "Authorization": f"Bearer {token.strip()}",
+        "Content-Type": "application/json"
+    }
+
+    # Free open-weights vision endpoints on Hugging Face
+    models = [
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+        "meta-llama/Llama-3.2-11B-Vision-Instruct"
     ]
 
-    for model_name in models_to_try:
+    for model in models:
+        url = f"https://api-inference.huggingface.co/models/{model}/v1/chat/completions"
         payload = {
-            "model": model_name,
+            "model": model,
             "messages": [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                     ]
                 }
             ],
-            "response_format": {"type": "json_object"}
+            "max_tokens": 500
         }
 
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            res_json = response.json()
-            
+            response = requests.post(url, headers=headers, json=payload, timeout=40)
             if response.status_code == 200:
-                raw_text = res_json["choices"][0]["message"]["content"]
-                data = json.loads(raw_text)
+                res_json = response.json()
+                content = res_json["choices"][0]["message"]["content"]
                 
-                extracted_name = data.get("student_name", "Unknown Student")
-                detected_answers = data.get("answers", {})
+                # Extract valid JSON from response
+                start_idx = content.find("{")
+                end_idx = content.rfind("}") + 1
+                if start_idx != -1 and end_idx != -1:
+                    data = json.loads(content[start_idx:end_idx])
+                    extracted_name = data.get("student_name", "Unknown Student")
+                    detected_answers = data.get("answers", {})
 
-                score = 0
-                for q in range(1, total_q + 1):
-                    student_ans = detected_answers.get(str(q))
-                    correct_ans = key_dict.get(q)
-                    if student_ans and str(student_ans).upper() == str(correct_ans).upper():
-                        score += 1
+                    score = 0
+                    for q in range(1, total_q + 1):
+                        student_ans = detected_answers.get(str(q))
+                        correct_ans = key_dict.get(q)
+                        if student_ans and str(student_ans).upper() == str(correct_ans).upper():
+                            score += 1
 
-                return extracted_name, score
-            elif response.status_code == 404:
-                continue
+                    return extracted_name, score
+            elif response.status_code in [503, 404]:
+                continue  # Cold boot or offline, fall back to next model
             else:
-                st.error(f"API Error ({response.status_code}): {res_json.get('error', {}).get('message', 'Unknown Error')}")
+                st.error(f"Hugging Face API Error ({response.status_code}): {response.text}")
                 return "Auth Error", 0
         except Exception:
             continue
 
-    st.error("No active vision model endpoints responded. Check your OpenRouter account balance or API key.")
+    st.error("Free inference models are currently busy or loading. Please retry in 30 seconds.")
     return "Processing Error", 0
 
 # ==================== TAB 1 ====================
@@ -284,19 +279,19 @@ with tab2:
 with tab3:
     st.header("📤 Step 3: Scan & Grade Answers with AI")
     
-    if not api_key:
-        st.error("🔑 `OPENROUTER_API_KEY` is missing! Please configure it in your Streamlit Secrets.")
+    if not hf_token:
+        st.error("🔑 `HF_TOKEN` is missing! Please configure it in your Streamlit Secrets.")
     
     uploaded_files = st.file_uploader("Upload filled student sheets (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
     
-    if uploaded_files and api_key:
-        if st.button("🤖 Grade Sheets with AI"):
+    if uploaded_files and hf_token:
+        if st.button("🤖 Grade Sheets with Free AI"):
             results = []
             progress_bar = st.progress(0)
             
             for idx, file in enumerate(uploaded_files):
                 file_bytes = file.read()
-                student_name, score = process_omr_with_ai(file_bytes, int(num_questions), answer_key, api_key)
+                student_name, score = process_omr_with_ai(file_bytes, int(num_questions), answer_key, hf_token)
                 
                 if student_name in ["Unknown Student", "Processing Error", "Auth Error"]:
                     student_name = os.path.splitext(file.name)[0]
