@@ -99,20 +99,20 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     
-    # Corner Registration Marks
+    # 1. Corner Calibration Anchors (500x700 working area canvas)
     c.setFillColorRGB(0, 0, 0)
     c.rect(30, 742, 20, 20, fill=1)
     c.rect(562, 742, 20, 20, fill=1)
     c.rect(30, 30, 20, 20, fill=1)
     c.rect(562, 30, 20, 20, fill=1)
     
-    # QR Code
+    # 2. QR Code
     qr = qrcode.make(f"{student_name}")
     qr_pil = qr.get_image()
     qr_reader = ImageReader(qr_pil)
     c.drawImage(qr_reader, 470, 665, width=75, height=75)
     
-    # Title & Name
+    # 3. Header Information
     c.setFont("Helvetica-Bold", 16)
     c.drawString(60, 740, str(exam_title))
     
@@ -123,7 +123,7 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     c.setLineWidth(1)
     c.line(60, 680, 542, 680)
     
-    # Questions
+    # 4. Bubble Grid Generator
     start_y = 650
     for q in range(1, total_q + 1):
         col_offset = ((q - 1) // 25) * 130
@@ -143,42 +143,44 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     return buffer.getvalue()
 
 def process_omr_image(img_bytes, total_q, key_dict):
-    """Aligns sheet and processes filled bubble circles."""
     np_arr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     if img is None:
         return "Unknown Student", 0
 
-    # 1. Decode QR Code for Student Name
+    # Read Student Name from QR
     qr_detector = cv2.QRCodeDetector()
     student_name, _, _ = qr_detector.detectAndDecode(img)
     if not student_name:
         student_name = "Unknown Student"
 
-    # 2. Image Preprocessing (Grayscale + Thresholding)
+    # Preprocessing
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
+    thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
 
-    # 3. Find Page Perspective Transformation Corners
+    # Find page corners
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rects = []
+    corners = []
+    
     for cnt in contours:
+        area = cv2.contourArea(cnt)
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-        if len(approx) == 4 and cv2.contourArea(cnt) > 200:
-            rects.append(approx)
+        
+        # Target square calibration marks
+        if len(approx) == 4 and area > 100:
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = float(w) / h
+            if 0.7 <= aspect_ratio <= 1.3:
+                corners.append((x + w / 2, y + h / 2))
 
-    # Warp image to a standardized 612x792 resolution (Letter size scale)
-    h, w = thresh.shape[:2]
+    # Standardized 800x1000 warped image space
+    W_WARP, H_WARP = 800, 1000
     warped = thresh
 
-    if len(rects) >= 4:
-        # Sort corners: Top-Left, Top-Right, Bottom-Right, Bottom-Left
-        pts = np.array([r.reshape(4, 2) for r in rects[:4]]).reshape(-1, 2)
+    if len(corners) >= 4:
+        pts = np.array(corners[:4], dtype="float32")
         s = pts.sum(axis=1)
         diff = np.diff(pts, axis=1)
 
@@ -188,35 +190,42 @@ def process_omr_image(img_bytes, total_q, key_dict):
         bl = pts[np.argmax(diff)]
 
         src_pts = np.float32([tl, tr, br, bl])
-        dst_pts = np.float32([[0, 0], [612, 0], [612, 792], [0, 792]])
+        dst_pts = np.float32([[0, 0], [W_WARP, 0], [W_WARP, H_WARP], [0, H_WARP]])
         matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        warped = cv2.warpPerspective(thresh, matrix, (612, 792))
+        warped = cv2.warpPerspective(thresh, matrix, (W_WARP, H_WARP))
 
-    # 4. Measure Bubble Pixel Densities
+    # Calculate Bubble Positions accurately using relative percentages
     score = 0
-    start_y = 142  # Scaled coordinate offset corresponding to ReportLab PDF layout
-    
+    start_x_pct = 0.15
+    start_y_pct = 0.22
+    row_height_pct = 0.028
+    col_width_pct = 0.22
+    opt_spacing_pct = 0.032
+
     for q in range(1, total_q + 1):
-        col_offset = ((q - 1) // 25) * 130
-        row = (q - 1) % 25
-        y_center = int(start_y + (row * 22))
-        x_start = int(60 + col_offset)
+        col_idx = (q - 1) // 25
+        row_idx = (q - 1) % 25
+        
+        y_center = int((start_y_pct + (row_idx * row_height_pct)) * H_WARP)
+        base_x = (start_x_pct + (col_idx * col_width_pct)) * W_WARP
 
-        bubble_counts = []
+        bubble_densities = []
         for idx, opt in enumerate(options):
-            bx = int(x_start + 25 + (idx * 20))
-            # Define ROI bounding circle area
-            roi = warped[y_center - 5 : y_center + 5, bx - 5 : bx + 5]
+            x_center = int(base_x + (idx * opt_spacing_pct * W_WARP))
+            
+            # ROI Box
+            r = 8
+            roi = warped[max(0, y_center - r):min(H_WARP, y_center + r), 
+                         max(0, x_center - r):min(W_WARP, x_center + r)]
+            
             non_zero = cv2.countNonZero(roi) if roi.size > 0 else 0
-            bubble_counts.append((non_zero, opt))
+            bubble_densities.append((non_zero, opt))
 
-        # Sort options by pixel density
-        bubble_counts.sort(key=lambda item: item[0], reverse=True)
-        detected_choice = bubble_counts[0][1]
-        max_filled = bubble_counts[0][0]
+        bubble_densities.sort(key=lambda item: item[0], reverse=True)
+        filled_pixels, selected_opt = bubble_densities[0]
 
-        # Ensure bubble was distinctly shaded (minimum fill threshold)
-        if max_filled > 25 and detected_choice == key_dict.get(q):
+        # Minimum required fill threshold (30 dark pixels)
+        if filled_pixels > 30 and selected_opt == key_dict.get(q):
             score += 1
 
     return student_name, score
