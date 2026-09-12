@@ -4,8 +4,8 @@ import numpy as np
 import io
 import os
 import zipfile
+import json
 import qrcode
-import cv2
 import urllib.request
 from PIL import Image
 import arabic_reshaper
@@ -15,13 +15,26 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from google import genai
+from google.genai import types
 
-st.set_page_config(page_title="Online OMR Scanner & Pre-printed Generator", layout="wide")
+st.set_page_config(page_title="AI OMR Scanner & Generator", layout="wide")
 
-st.title("📄 Pre-printed OMR Sheet Generator & Scanner")
-st.write("Generate personalized bubble sheets with embedded QR codes and manage exam grading seamlessly.")
+st.title("📄 AI-Powered OMR Sheet Generator & Scanner")
+st.write("Generate personalized bubble sheets and grade them using Gemini AI Vision.")
 
-# ==================== ARABIC FONT INITIALIZATION ====================
+# ==================== GEMINI AI CLIENT SETUP ====================
+api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+
+@st.cache_resource
+def get_ai_client(key):
+    if key:
+        return genai.Client(api_key=key)
+    return None
+
+client = get_ai_client(api_key)
+
+# ==================== ARABIC FONT SETUP ====================
 FONT_PATH = "Amiri-Regular.ttf"
 FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf"
 
@@ -64,7 +77,7 @@ for q in range(1, int(num_questions) + 1):
     target_col = sb_col1 if q <= (num_questions // 2 + num_questions % 2) else sb_col2
     answer_key[q] = target_col.selectbox(f"Q{q:02d}", options, index=0, key=f"ans_key_{q}")
 
-tab1, tab2, tab3 = st.tabs(["1. Upload Student List", "2. Generate Pre-Printed Sheets", "3. Scan & Grade Sheets"])
+tab1, tab2, tab3 = st.tabs(["1. Upload Student List", "2. Generate Pre-Printed Sheets", "3. Scan & Grade Sheets (AI)"])
 
 # ==================== HELPER FUNCTIONS ====================
 def load_student_dataframe(uploaded_file):
@@ -99,20 +112,20 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     
-    # 1. Corner Calibration Anchors (500x700 working area canvas)
+    # Calibration Anchors
     c.setFillColorRGB(0, 0, 0)
     c.rect(30, 742, 20, 20, fill=1)
     c.rect(562, 742, 20, 20, fill=1)
     c.rect(30, 30, 20, 20, fill=1)
     c.rect(562, 30, 20, 20, fill=1)
     
-    # 2. QR Code
+    # QR Code
     qr = qrcode.make(f"{student_name}")
     qr_pil = qr.get_image()
     qr_reader = ImageReader(qr_pil)
     c.drawImage(qr_reader, 470, 665, width=75, height=75)
     
-    # 3. Header Information
+    # Header
     c.setFont("Helvetica-Bold", 16)
     c.drawString(60, 740, str(exam_title))
     
@@ -123,7 +136,7 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     c.setLineWidth(1)
     c.line(60, 680, 542, 680)
     
-    # 4. Bubble Grid Generator
+    # Questions
     start_y = 650
     for q in range(1, total_q + 1):
         col_offset = ((q - 1) // 25) * 130
@@ -142,93 +155,54 @@ def create_pdf_bytes(student_name, exam_title, total_q):
     buffer.seek(0)
     return buffer.getvalue()
 
-def process_omr_image(img_bytes, total_q, key_dict):
-    np_arr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return "Unknown Student", 0
+def process_omr_with_ai(img_bytes, total_q, key_dict):
+    if not client:
+        return "API Key Missing", 0
 
-    # Read Student Name from QR
-    qr_detector = cv2.QRCodeDetector()
-    student_name, _, _ = qr_detector.detectAndDecode(img)
-    if not student_name:
-        student_name = "Unknown Student"
+    image = Image.open(io.BytesIO(img_bytes))
 
-    # Preprocessing
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-
-    # Find page corners
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    corners = []
+    prompt = f"""
+    Analyze this exam sheet image carefully.
+    1. Extract the student name written at the top next to "Student Name:" or decoded from the QR code.
+    2. Examine questions Q01 through Q{total_q:02d}.
+    3. For each question, determine which bubble option (A, B, C, or D) is filled/shaded in with pencil or pen. If a question is left completely blank or has multiple bubbles filled, mark it as null.
     
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+    Return ONLY a raw JSON object with this exact structure:
+    {{
+      "student_name": "Extracted Student Name",
+      "answers": {{
+        "1": "A",
+        "2": "B",
+        "3": null
+      }}
+    }}
+    """
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[image, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
         
-        # Target square calibration marks
-        if len(approx) == 4 and area > 100:
-            x, y, w, h = cv2.boundingRect(cnt)
-            aspect_ratio = float(w) / h
-            if 0.7 <= aspect_ratio <= 1.3:
-                corners.append((x + w / 2, y + h / 2))
+        data = json.loads(response.text)
+        extracted_name = data.get("student_name", "Unknown Student")
+        detected_answers = data.get("answers", {})
 
-    # Standardized 800x1000 warped image space
-    W_WARP, H_WARP = 800, 1000
-    warped = thresh
+        score = 0
+        for q in range(1, total_q + 1):
+            student_ans = detected_answers.get(str(q))
+            correct_ans = key_dict.get(q)
+            if student_ans and str(student_ans).upper() == str(correct_ans).upper():
+                score += 1
 
-    if len(corners) >= 4:
-        pts = np.array(corners[:4], dtype="float32")
-        s = pts.sum(axis=1)
-        diff = np.diff(pts, axis=1)
+        return extracted_name, score
 
-        tl = pts[np.argmin(s)]
-        br = pts[np.argmax(s)]
-        tr = pts[np.argmin(diff)]
-        bl = pts[np.argmax(diff)]
-
-        src_pts = np.float32([tl, tr, br, bl])
-        dst_pts = np.float32([[0, 0], [W_WARP, 0], [W_WARP, H_WARP], [0, H_WARP]])
-        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        warped = cv2.warpPerspective(thresh, matrix, (W_WARP, H_WARP))
-
-    # Calculate Bubble Positions accurately using relative percentages
-    score = 0
-    start_x_pct = 0.15
-    start_y_pct = 0.22
-    row_height_pct = 0.028
-    col_width_pct = 0.22
-    opt_spacing_pct = 0.032
-
-    for q in range(1, total_q + 1):
-        col_idx = (q - 1) // 25
-        row_idx = (q - 1) % 25
-        
-        y_center = int((start_y_pct + (row_idx * row_height_pct)) * H_WARP)
-        base_x = (start_x_pct + (col_idx * col_width_pct)) * W_WARP
-
-        bubble_densities = []
-        for idx, opt in enumerate(options):
-            x_center = int(base_x + (idx * opt_spacing_pct * W_WARP))
-            
-            # ROI Box
-            r = 8
-            roi = warped[max(0, y_center - r):min(H_WARP, y_center + r), 
-                         max(0, x_center - r):min(W_WARP, x_center + r)]
-            
-            non_zero = cv2.countNonZero(roi) if roi.size > 0 else 0
-            bubble_densities.append((non_zero, opt))
-
-        bubble_densities.sort(key=lambda item: item[0], reverse=True)
-        filled_pixels, selected_opt = bubble_densities[0]
-
-        # Minimum required fill threshold (30 dark pixels)
-        if filled_pixels > 30 and selected_opt == key_dict.get(q):
-            score += 1
-
-    return student_name, score
+    except Exception as e:
+        st.error(f"AI Vision Processing Error: {e}")
+        return "Processing Error", 0
 
 # ==================== TAB 1 ====================
 with tab1:
@@ -282,37 +256,47 @@ with tab2:
 
 # ==================== TAB 3 ====================
 with tab3:
-    st.header("📤 Step 3: Scan & Grade Answers")
-    uploaded_files = st.file_uploader("Upload filled student sheets (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
-    if uploaded_files:
-        results = []
-        for file in uploaded_files:
-            file_bytes = file.read()
-            student_name, score = process_omr_image(file_bytes, int(num_questions), answer_key)
+    st.header("📤 Step 3: Scan & Grade Answers with AI")
+    
+    if not api_key:
+        st.error("🔑 `GEMINI_API_KEY` is missing! Please configure it in your Streamlit Secrets.")
+    
+    uploaded_files = st.file_uploader("Upload filled student sheets (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    
+    if uploaded_files and api_key:
+        if st.button("🤖 Grade Sheets with AI"):
+            results = []
+            progress_bar = st.progress(0)
             
-            if student_name == "Unknown Student":
-                student_name = os.path.splitext(file.name)[0]
+            for idx, file in enumerate(uploaded_files):
+                file_bytes = file.read()
+                student_name, score = process_omr_with_ai(file_bytes, int(num_questions), answer_key)
                 
-            pct = (score / num_questions) * 100
+                if student_name in ["Unknown Student", "Processing Error"]:
+                    student_name = os.path.splitext(file.name)[0]
+                    
+                pct = (score / num_questions) * 100
+                
+                results.append({
+                    "Student Name": student_name,
+                    "File Name": file.name,
+                    "Score": f"{score}/{int(num_questions)}",
+                    "Percentage": f"{pct:.1f}%",
+                    "Status": "PASS" if pct >= 50 else "FAIL"
+                })
+                
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+                
+            df_res = pd.DataFrame(results)
+            st.dataframe(df_res, use_container_width=True)
             
-            results.append({
-                "Student Name": student_name,
-                "File Name": file.name,
-                "Score": f"{score}/{int(num_questions)}",
-                "Percentage": f"{pct:.1f}%",
-                "Status": "PASS" if pct >= 50 else "FAIL"
-            })
+            excel_buf = io.BytesIO()
+            df_res.to_excel(excel_buf, index=False)
+            excel_buf.seek(0)
             
-        df_res = pd.DataFrame(results)
-        st.dataframe(df_res, use_container_width=True)
-        
-        excel_buf = io.BytesIO()
-        df_res.to_excel(excel_buf, index=False)
-        excel_buf.seek(0)
-        
-        st.download_button(
-            label="📊 Download Graded Results (Excel)",
-            data=excel_buf,
-            file_name="OMR_Graded_Results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            st.download_button(
+                label="📊 Download Graded Results (Excel)",
+                data=excel_buf,
+                file_name="AI_OMR_Graded_Results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
