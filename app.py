@@ -20,10 +20,10 @@ from reportlab.pdfbase.ttfonts import TTFont
 st.set_page_config(page_title="AI OMR Scanner & Generator", layout="wide")
 
 st.title("📄 AI-Powered OMR Sheet Generator & Scanner")
-st.write("Generate personalized bubble sheets and grade them using Gemini AI Vision.")
+st.write("Generate personalized bubble sheets and grade them using OpenRouter AI Vision.")
 
 # ==================== API KEY RETRIEVAL ====================
-api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+api_key = st.secrets.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY"))
 
 # ==================== ARABIC FONT SETUP ====================
 FONT_PATH = "Amiri-Regular.ttf"
@@ -151,16 +151,18 @@ def process_omr_with_ai(img_bytes, total_q, key_dict, key):
         return "API Key Missing", 0
 
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
-    clean_key = str(key).strip()
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={clean_key}"
-    headers = {"Content-Type": "application/json"}
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key.strip()}",
+        "Content-Type": "application/json"
+    }
     
     prompt = f"""
     Analyze this exam sheet image carefully.
     1. Extract the student name written next to "Student Name:" or decoded from the top QR code.
     2. Examine questions Q01 through Q{total_q:02d}.
-    3. Determine which option (A, B, C, or D) is filled/shaded in pencil or pen. If unshaded or ambiguous, mark as null.
+    3. Determine which option (A, B, C, or D) is filled/shaded in pencil or pen. If unshaded, mark as null.
     
     Return ONLY a raw JSON object formatted like this:
     {{
@@ -173,15 +175,25 @@ def process_omr_with_ai(img_bytes, total_q, key_dict, key):
     """
     
     payload = {
-        "contents": [{
-            "parts": [
-                {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}},
-                {"text": prompt}
-            ]
-        }],
-        "generationConfig": {
-            "response_mime_type": "application/json"
-        }
+        "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }
+        ],
+        "response_format": {"type": "json_object"}
     }
 
     try:
@@ -192,7 +204,7 @@ def process_omr_with_ai(img_bytes, total_q, key_dict, key):
             st.error(f"API Error ({response.status_code}): {res_json.get('error', {}).get('message', 'Unknown Error')}")
             return "Auth Error", 0
             
-        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+        raw_text = res_json["choices"][0]["message"]["content"]
         data = json.loads(raw_text)
         
         extracted_name = data.get("student_name", "Unknown Student")
@@ -266,7 +278,7 @@ with tab3:
     st.header("📤 Step 3: Scan & Grade Answers with AI")
     
     if not api_key:
-        st.error("🔑 `GEMINI_API_KEY` is missing! Please configure it in your Streamlit Secrets.")
+        st.error("🔑 `OPENROUTER_API_KEY` is missing! Please configure it in your Streamlit Secrets.")
     
     uploaded_files = st.file_uploader("Upload filled student sheets (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
     
